@@ -1,0 +1,54 @@
+{
+  "data": {
+    "events_path": "data/toy_events.csv",
+    "metadata_path": "data/toy_metadata.json",
+    "distance_matrix_path": "",
+    "train_split": 0.8,
+    "val_split": 0.1
+  },
+  "graph": {
+    "sigma": 1.0,
+    "sigma_jump": 1.0,
+    "knn": null
+  },
+  "model": {
+    "latent_dim": 8,
+    "time_embed_dim": 8,
+    "node_embed_dim": 4,
+    "mlp_hidden_dim": 16,
+    "time_hidden_dim": 16,
+    "alpha_init": 0.1,
+    "beta_init": 0.1,
+    "jump_eta": 0.0,
+    "eps": 1e-8,
+    "baseline_init": 0.0
+  },
+  "solver": {
+    "method": "dopri5",
+    "rtol": 0.0005,
+    "atol": 1e-06,
+    "max_num_steps": 1000,
+    "use_adjoint": false,
+    "min_dt": 1e-7,
+    "min_step": 1e-6,
+    "time_dtype": "float64",
+    "fallback_method": "rk4"
+  },
+  "regularization": {
+    "lambda_z": 0.0,
+    "lambda_jump": 0.0,
+    "lambda_beta": 0.0
+  },
+  "training": {
+    "epochs": 5,
+    "chunk_size": 64,
+    "eval_chunk_size": 128,
+    "lr": 0.005,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "seed": 123,
+    "device": "cuda_if_available",
+    "artifacts_dir": "artifacts",
+    "run_name": "gdch_toy"
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "data": {
+    "events_path": "data/events.csv",
+    "metadata_path": "data/metadata.json",
+    "distance_matrix_path": "data/distance.npy",
+    "train_split": 0.7,
+    "val_split": 0.15
+  },
+  "graph": {
+    "sigma": 1400.0,
+    "sigma_jump": 200.0,
+    "knn": null
+  },
+  "model": {
+    "latent_dim": 32,
+    "time_embed_dim": 32,
+    "node_embed_dim": 8,
+    "mlp_hidden_dim": 64,
+    "time_hidden_dim": 64,
+    "alpha_init": 0.05,
+    "beta_init": 0.1,
+    "jump_eta": 0.0,
+    "jump_tanh": true,
+    "jump_scale": 1.0,
+    "gate_use_z": true,
+    "intensity_use_z": true,
+    "eps": 1e-8,
+    "baseline_init": 0.0,
+    "baseline_from_data": true,
+    "per_node_w": true
+  },
+  "solver": {
+    "method": "dopri5",
+    "rtol": 0.0001,
+    "atol": 1e-06,
+    "max_num_steps": 1000,
+    "event_max_num_steps": 10000,
+    "event_fallback_steps": 200,
+    "use_adjoint": false,
+    "min_dt": 1e-6,
+    "min_step": 1e-6,
+    "time_dtype": "float32",
+    "fallback_method": "rk4"
+  },
+  "regularization": {
+    "lambda_z": 1e-05,
+    "lambda_jump": 1e-05,
+    "lambda_beta": 1e-06
+  },
+  "training": {
+    "epochs": 100,
+    "chunk_size": 256,
+    "eval_chunk_size": 1024,
+    "lr": 0.0003,
+    "weight_decay": 1e-03,
+    "grad_clip": 2.0,
+    "log_every": 20,
+    "lr_scheduler": {
+      "type": "plateau",
+      "factor": 0.5,
+      "patience": 3,
+      "threshold": 1e-2,
+      "min_lr": 1e-6
+    },
+    "seed": 42,
+    "device": "cuda_if_available",
+    "artifacts_dir": "artifacts",
+    "run_name": "gdch"
+  }
+}

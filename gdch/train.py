@@ -1,0 +1,251 @@
+import argparse
+import math
+import os
+from typing import Dict, Tuple
+
+import torch
+import torch.optim as optim
+
+from gdch import data as data_utils
+from gdch import graph as graph_utils
+from gdch.eval import evaluate_nll
+from gdch.losses import add_regularization
+from gdch.model import GDCH
+from gdch.utils import apply_overrides, detach_state, get_device, load_config, make_run_dir, save_config, set_seed, setup_logger
+
+
+def _build_graph(distance_path: str, graph_cfg: Dict, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not distance_path or not os.path.exists(distance_path):
+        return None, None
+    dmat = graph_utils.load_distance_matrix(distance_path)
+    sigma = float(graph_cfg.get("sigma", 1.0))
+    sigma_jump = float(graph_cfg.get("sigma_jump", sigma))
+    knn = graph_cfg.get("knn", None)
+
+    l, _w = graph_utils.build_graph_from_distance(dmat, sigma=sigma, knn=knn)
+    k = graph_utils.build_jump_kernel(dmat, sigma_jump=sigma_jump)
+
+    return l.to(device=device), k.to(device=device)
+
+
+def _build_model(config: Dict, metadata: Dict, device: torch.device, laplacian, jump_kernel) -> GDCH:
+    model_cfg = config["model"]
+    model = GDCH(
+        num_nodes=int(metadata["num_nodes"]),
+        latent_dim=int(model_cfg.get("latent_dim", 16)),
+        time_embed_dim=int(model_cfg.get("time_embed_dim", 16)),
+        node_embed_dim=int(model_cfg.get("node_embed_dim", 8)),
+        mlp_hidden_dim=model_cfg.get("mlp_hidden_dim", None),
+        time_hidden_dim=model_cfg.get("time_hidden_dim", None),
+        alpha_init=float(model_cfg.get("alpha_init", 0.1)),
+        beta_init=float(model_cfg.get("beta_init", 0.1)),
+        jump_eta=float(model_cfg.get("jump_eta", 0.0)),
+        jump_tanh=bool(model_cfg.get("jump_tanh", False)),
+        jump_scale=float(model_cfg.get("jump_scale", 1.0)),
+        gate_use_z=bool(model_cfg.get("gate_use_z", False)),
+        intensity_use_z=bool(model_cfg.get("intensity_use_z", False)),
+        eps=float(model_cfg.get("eps", 1e-8)),
+        t0_days=float(metadata.get("t0_days", 0.0)),
+        total_time=float(metadata.get("duration_days", 1.0)),
+        baseline_init=float(model_cfg.get("baseline_init", 0.0)),
+        per_node_w=bool(model_cfg.get("per_node_w", False)),
+        laplacian=laplacian,
+        jump_kernel=jump_kernel,
+    )
+    return model.to(device)
+
+
+def train_from_config(config: Dict) -> str:
+    train_cfg = config["training"]
+    data_cfg = config["data"]
+    solver_cfg = config.get("solver", {})
+    reg_cfg = config.get("regularization", {})
+
+    set_seed(int(train_cfg.get("seed", 42)))
+    device = get_device(train_cfg.get("device", "cuda_if_available"))
+
+    times, nodes = data_utils.load_processed_events(data_cfg["events_path"])
+    metadata = data_utils.load_metadata(data_cfg["metadata_path"])
+
+    split_idx = data_utils.split_by_time(
+        times.numpy(),
+        train_frac=float(data_cfg.get("train_split", 0.8)),
+        val_frac=float(data_cfg.get("val_split", 0.1)),
+    )
+
+    train_idx = split_idx["train"]
+    val_idx = split_idx["val"]
+
+    times_train = times[train_idx].to(device=device)
+    nodes_train = nodes[train_idx].to(device=device)
+    times_val = times[val_idx].to(device=device)
+    nodes_val = nodes[val_idx].to(device=device)
+
+    laplacian, jump_kernel = _build_graph(data_cfg.get("distance_matrix_path", ""), config.get("graph", {}), device)
+    model = _build_model(config, metadata, device, laplacian, jump_kernel)
+
+    model_cfg = config["model"]
+    if bool(model_cfg.get("baseline_from_data", False)) and len(times_train) > 1:
+        duration = (times_train[-1] - times_train[0]).clamp_min(1e-6)
+        counts = torch.bincount(nodes_train, minlength=int(metadata["num_nodes"])).to(times_train.device)
+        rates = (counts.float() / duration).clamp_min(1e-8)
+        b_init = torch.log(torch.expm1(rates))
+        b_init = torch.where(torch.isfinite(b_init), b_init, torch.log(rates))
+        with torch.no_grad():
+            model.b.copy_(b_init)
+
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=float(train_cfg.get("lr", 1e-3)),
+        weight_decay=float(train_cfg.get("weight_decay", 0.0)),
+    )
+    scheduler_cfg = train_cfg.get("lr_scheduler", None)
+    scheduler = None
+    scheduler_type = None
+    if isinstance(scheduler_cfg, dict):
+        scheduler_type = str(scheduler_cfg.get("type", "plateau")).lower()
+        if scheduler_type == "plateau":
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=float(scheduler_cfg.get("factor", 0.5)),
+                patience=int(scheduler_cfg.get("patience", 2)),
+                threshold=float(scheduler_cfg.get("threshold", 1e-3)),
+                min_lr=float(scheduler_cfg.get("min_lr", 1e-6)),
+            )
+        elif scheduler_type == "cosine":
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=int(scheduler_cfg.get("t_max", 10)),
+                eta_min=float(scheduler_cfg.get("min_lr", 1e-6)),
+            )
+
+    run_dir = make_run_dir(train_cfg.get("artifacts_dir", "artifacts"), train_cfg.get("run_name", "gdch"))
+    logger = setup_logger(os.path.join(run_dir, "train.log"))
+    save_config(config, os.path.join(run_dir, "config.json"))
+
+    chunk_size = int(train_cfg.get("chunk_size", 256))
+    eval_chunk_size = int(train_cfg.get("eval_chunk_size", chunk_size))
+    grad_clip = float(train_cfg.get("grad_clip", 0.0))
+    log_every = int(train_cfg.get("log_every", 50))
+
+    best_val = math.inf
+    metrics = []
+
+    for epoch in range(1, int(train_cfg.get("epochs", 10)) + 1):
+        model.train()
+        state = None
+        nll_sum = 0.0
+        event_count = 0
+
+        total_chunks = max(1, math.ceil(len(times_train) / chunk_size))
+        chunk_counter = 0
+        window_nll = 0.0
+        window_events = 0
+
+        for start in range(0, len(times_train), chunk_size):
+            end = min(start + chunk_size - 1, len(times_train) - 1)
+            chunk_counter += 1
+            nll, state, reg_terms = model.nll_chunk(
+                times_train,
+                nodes_train,
+                start_idx=start,
+                end_idx=end,
+                state=state,
+                solver_config=solver_cfg,
+                collect_reg=True,
+            )
+            loss, reg_info = add_regularization(nll, reg_terms, model, reg_cfg)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+            state = detach_state(state)
+            nll_sum += nll.item()
+            event_count += end - start + 1
+
+            window_nll += nll.item()
+            window_events += end - start + 1
+            if log_every > 0 and (chunk_counter % log_every == 0 or chunk_counter == total_chunks):
+                avg_nll = window_nll / max(window_events, 1)
+                logger.info(
+                    "epoch=%d chunk=%d/%d avg_nll=%.6f",
+                    epoch,
+                    chunk_counter,
+                    total_chunks,
+                    avg_nll,
+                )
+                window_nll = 0.0
+                window_events = 0
+
+        train_nll = nll_sum / max(event_count, 1)
+
+        if len(times_val) > 0:
+            val_nll = evaluate_nll(
+                model,
+                times_val,
+                nodes_val,
+                solver_config=solver_cfg,
+                chunk_size=eval_chunk_size,
+                warmup=(times_train, nodes_train),
+            )
+        else:
+            val_nll = float("nan")
+
+        if scheduler is not None:
+            metric = val_nll if not math.isnan(val_nll) else train_nll
+            if scheduler_type == "plateau":
+                scheduler.step(metric)
+            else:
+                scheduler.step()
+
+        current_lr = optimizer.param_groups[0]["lr"]
+        metrics.append(
+            {"epoch": epoch, "train_nll": train_nll, "val_nll": val_nll, "lr": current_lr}
+        )
+        logger.info(
+            "epoch=%d train_nll=%.6f val_nll=%.6f lr=%.6g",
+            epoch,
+            train_nll,
+            val_nll,
+            current_lr,
+        )
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "train_nll": train_nll,
+            "val_nll": val_nll,
+        }
+        torch.save(checkpoint, os.path.join(run_dir, "checkpoint_last.pt"))
+
+        if not math.isnan(val_nll) and val_nll < best_val:
+            best_val = val_nll
+            torch.save(checkpoint, os.path.join(run_dir, "checkpoint_best.pt"))
+
+    metrics_path = os.path.join(run_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        import json
+
+        json.dump(metrics, f, indent=2)
+
+    return run_dir
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train GDCH model")
+    parser.add_argument("--config", required=True, help="Path to config JSON")
+    parser.add_argument("--override", action="append", default=[], help="Override config keys, e.g. training.epochs=5")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    config = apply_overrides(config, args.override)
+    train_from_config(config)
+
+
+if __name__ == "__main__":
+    main()
