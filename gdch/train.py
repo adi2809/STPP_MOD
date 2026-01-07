@@ -73,6 +73,30 @@ def _maybe_adjust_min_dt(solver_cfg: Dict, min_gap: float, logger) -> None:
         )
 
 
+def _log_graph_warnings(data_cfg: Dict, model_cfg: Dict, laplacian, jump_kernel, logger) -> None:
+    distance_path = data_cfg.get("distance_matrix_path", "")
+    if not distance_path:
+        logger.warning(
+            "distance_matrix_path is empty; spatial diffusion and jump spillover will be disabled"
+        )
+        return
+    if laplacian is None:
+        logger.warning(
+            "distance_matrix_path=%s not found or invalid; spatial diffusion will be disabled",
+            distance_path,
+        )
+    if jump_kernel is None:
+        logger.warning(
+            "distance_matrix_path=%s not found or invalid; jump spillover will be disabled",
+            distance_path,
+        )
+    jump_eta = float(model_cfg.get("jump_eta", 0.0))
+    if jump_kernel is not None and jump_eta == 0.0:
+        logger.warning(
+            "jump_eta=0.0 with a valid distance matrix; set model.jump_eta to enable spillover"
+        )
+
+
 def train_from_config(config: Dict) -> str:
     train_cfg = config["training"]
     data_cfg = config["data"]
@@ -141,6 +165,8 @@ def train_from_config(config: Dict) -> str:
     run_dir = make_run_dir(train_cfg.get("artifacts_dir", "artifacts"), train_cfg.get("run_name", "gdch"))
     logger = setup_logger(os.path.join(run_dir, "train.log"))
     save_config(config, os.path.join(run_dir, "config.json"))
+
+    _log_graph_warnings(data_cfg, model_cfg, laplacian, jump_kernel, logger)
 
     if len(times_train) > 1:
         min_gap = float((times_train[1:] - times_train[:-1]).min().item())
