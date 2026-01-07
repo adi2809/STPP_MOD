@@ -43,13 +43,31 @@ def calendar_features(t: torch.Tensor, t0_days: float = 0.0, total_time: float =
 
 
 class TimeEmbedding(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims,
+        output_dim: int,
+        dropout: float = 0.0,
+        layer_norm: bool = False,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
+        if hidden_dims is None:
+            hidden_dims = []
+        if isinstance(hidden_dims, int):
+            hidden_dims = [hidden_dims]
+        layers = []
+        prev_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.SiLU())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, output_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
