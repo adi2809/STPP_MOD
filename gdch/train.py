@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import time
 from typing import Dict, Tuple
 
 import torch
@@ -189,9 +190,13 @@ def train_from_config(config: Dict) -> str:
         _maybe_adjust_min_dt(solver_cfg, min_gap, logger)
 
     chunk_size = int(train_cfg.get("chunk_size", 256))
+    use_dataloader = bool(train_cfg.get("use_dataloader", False))
+    num_workers = int(train_cfg.get("num_workers", 0))
+    pin_memory = bool(train_cfg.get("pin_memory", False))
     eval_chunk_size = int(train_cfg.get("eval_chunk_size", chunk_size))
     grad_clip = float(train_cfg.get("grad_clip", 0.0))
     log_every = int(train_cfg.get("log_every", 50))
+    log_every_seconds = float(train_cfg.get("log_every_seconds", 0.0))
     eval_every = int(train_cfg.get("eval_every", 1))
     warmup_steps = int(train_cfg.get("warmup_steps", 0))
     base_lr = float(train_cfg.get("lr", 1e-3))
@@ -207,12 +212,30 @@ def train_from_config(config: Dict) -> str:
         event_count = 0
 
         total_chunks = max(1, math.ceil(len(times_train) / chunk_size))
+        chunk_iter = None
+        if use_dataloader:
+            chunk_iter = data_utils.make_chunk_loader(
+                len(times_train), chunk_size, num_workers=num_workers, pin_memory=pin_memory
+            )
         chunk_counter = 0
         window_nll = 0.0
         window_events = 0
+        last_log_time = time.time()
+        logger.info("epoch=%d/%d start", epoch, int(train_cfg.get("epochs", 10)))
 
-        for start in range(0, len(times_train), chunk_size):
-            end = min(start + chunk_size - 1, len(times_train) - 1)
+        if chunk_iter is None:
+            chunk_iter = range(0, len(times_train), chunk_size)
+        for batch in chunk_iter:
+            if isinstance(batch, int):
+                start = batch
+                end = min(start + chunk_size - 1, len(times_train) - 1)
+            else:
+                start = batch["start"]
+                end = batch["end"]
+                if torch.is_tensor(start):
+                    start = int(start.flatten()[0].item())
+                if torch.is_tensor(end):
+                    end = int(end.flatten()[0].item())
             chunk_counter += 1
             with torch.cuda.amp.autocast(enabled=use_amp):
                 nll, state, reg_terms = model.nll_chunk(
@@ -260,7 +283,11 @@ def train_from_config(config: Dict) -> str:
 
             window_nll += nll.item()
             window_events += end - start + 1
-            if log_every > 0 and (chunk_counter % log_every == 0 or chunk_counter == total_chunks):
+            should_log_chunk = log_every > 0 and (
+                chunk_counter % log_every == 0 or chunk_counter == total_chunks
+            )
+            should_log_time = log_every_seconds > 0 and (time.time() - last_log_time) >= log_every_seconds
+            if should_log_chunk or should_log_time:
                 avg_nll = window_nll / max(window_events, 1)
                 logger.info(
                     "epoch=%d chunk=%d/%d avg_nll=%.6f",
@@ -271,6 +298,7 @@ def train_from_config(config: Dict) -> str:
                 )
                 window_nll = 0.0
                 window_events = 0
+                last_log_time = time.time()
 
         train_nll = nll_sum / max(event_count, 1)
 

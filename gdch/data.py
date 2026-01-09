@@ -3,6 +3,7 @@ import json
 import os
 from typing import Dict, Optional, Tuple
 
+import math
 import numpy as np
 import pandas as pd
 import torch
@@ -127,6 +128,40 @@ def load_processed_events(events_path: str) -> Tuple[torch.Tensor, torch.Tensor]
     times = torch.tensor(df["t"].to_numpy(dtype=np.float32))
     nodes = torch.tensor(df["opo_id"].to_numpy(dtype=np.int64))
     return times, nodes
+
+
+class ChunkDataset(torch.utils.data.IterableDataset):
+    def __init__(self, num_events: int, chunk_size: int) -> None:
+        super().__init__()
+        self.num_events = int(num_events)
+        self.chunk_size = int(chunk_size)
+
+    def __iter__(self):
+        if self.num_events <= 0:
+            return iter(())
+        for start in range(0, self.num_events, self.chunk_size):
+            end = min(start + self.chunk_size - 1, self.num_events - 1)
+            yield {"start": start, "end": end}
+
+    def __len__(self) -> int:
+        if self.num_events <= 0:
+            return 0
+        return int(math.ceil(self.num_events / self.chunk_size))
+
+
+def make_chunk_loader(
+    num_events: int,
+    chunk_size: int,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+) -> torch.utils.data.DataLoader:
+    dataset = ChunkDataset(num_events, chunk_size)
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=1,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+    )
 
 
 def load_metadata(metadata_path: str) -> Dict[str, object]:
