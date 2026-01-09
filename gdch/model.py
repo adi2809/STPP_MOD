@@ -16,13 +16,32 @@ def inv_softplus(x: float) -> float:
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dims,
+        out_dim: int,
+        dropout: float = 0.0,
+        layer_norm: bool = False,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
+        if hidden_dims is None:
+            hidden_dims = []
+        if isinstance(hidden_dims, int):
+            hidden_dims = [hidden_dims]
+
+        layers = []
+        prev_dim = in_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(nn.SiLU())
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        layers.append(nn.Linear(prev_dim, out_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
@@ -49,6 +68,17 @@ class GDCH(nn.Module):
         node_embed_dim: int,
         mlp_hidden_dim: Optional[int] = None,
         time_hidden_dim: Optional[int] = None,
+        mlp_layers: Optional[Tuple[int, ...]] = None,
+        time_mlp_layers: Optional[Tuple[int, ...]] = None,
+        mlp_dropout: float = 0.0,
+        mlp_layer_norm: bool = False,
+        time_mlp_dropout: float = 0.0,
+        time_mlp_layer_norm: bool = False,
+        intensity_activation: str = "softplus",
+        intensity_beta: float = 1.0,
+        intensity_min: float = 0.0,
+        intensity_neg_slope: float = 0.01,
+        gate_activation: str = "sigmoid",
         alpha_init: float = 0.1,
         beta_init: float = 0.1,
         jump_eta: float = 0.0,
@@ -73,6 +103,8 @@ class GDCH(nn.Module):
 
         mlp_hidden_dim = mlp_hidden_dim or max(latent_dim, 16)
         time_hidden_dim = time_hidden_dim or max(time_embed_dim, 16)
+        mlp_layers = mlp_layers or (mlp_hidden_dim,)
+        time_mlp_layers = time_mlp_layers or (time_hidden_dim,)
 
         self.Z0 = nn.Parameter(torch.randn(num_nodes, latent_dim) * 0.01)
         self.b = nn.Parameter(torch.full((num_nodes,), float(baseline_init)))
@@ -85,17 +117,29 @@ class GDCH(nn.Module):
         self._alpha = nn.Parameter(torch.tensor(inv_softplus(alpha_init), dtype=torch.float32))
         self._beta = nn.Parameter(torch.tensor(inv_softplus(beta_init), dtype=torch.float32))
 
-        self.time_embed = TimeEmbedding(self.d_t, time_hidden_dim, time_embed_dim)
+        self.time_embed = TimeEmbedding(
+            self.d_t,
+            time_mlp_layers,
+            time_embed_dim,
+            dropout=time_mlp_dropout,
+            layer_norm=time_mlp_layer_norm,
+        )
         self.node_embed = nn.Embedding(num_nodes, node_embed_dim)
 
-        self.mlp_u = MLP(time_embed_dim, mlp_hidden_dim, latent_dim)
+        self.mlp_u = MLP(time_embed_dim, mlp_layers, latent_dim, dropout=mlp_dropout, layer_norm=mlp_layer_norm)
         self.gate_use_z = bool(gate_use_z)
         self.intensity_use_z = bool(intensity_use_z)
         r_in_dim = time_embed_dim + node_embed_dim + (latent_dim if self.gate_use_z else 0)
-        self.mlp_r = MLP(r_in_dim, mlp_hidden_dim, latent_dim)
-        self.jump_net = MLP(latent_dim + time_embed_dim + node_embed_dim, mlp_hidden_dim, latent_dim)
+        self.mlp_r = MLP(r_in_dim, mlp_layers, latent_dim, dropout=mlp_dropout, layer_norm=mlp_layer_norm)
+        self.jump_net = MLP(
+            latent_dim + time_embed_dim + node_embed_dim,
+            mlp_layers,
+            latent_dim,
+            dropout=mlp_dropout,
+            layer_norm=mlp_layer_norm,
+        )
         h_in_dim = time_embed_dim + node_embed_dim + (latent_dim if self.intensity_use_z else 0)
-        self.intensity_net = MLP(h_in_dim, mlp_hidden_dim, 1)
+        self.intensity_net = MLP(h_in_dim, mlp_layers, 1, dropout=mlp_dropout, layer_norm=mlp_layer_norm)
 
         self.jump_eta = float(jump_eta)
         self.jump_tanh = bool(jump_tanh)
@@ -103,6 +147,11 @@ class GDCH(nn.Module):
         self.eps = float(eps)
         self.t0_days = float(t0_days)
         self.total_time = float(total_time) if total_time > 0 else 1.0
+        self.intensity_activation = str(intensity_activation).lower()
+        self.intensity_beta = float(intensity_beta)
+        self.intensity_min = float(intensity_min)
+        self.intensity_neg_slope = float(intensity_neg_slope)
+        self.gate_activation = str(gate_activation).lower()
 
         if laplacian is not None:
             self.register_buffer("L", laplacian)
@@ -244,7 +293,21 @@ class GDCH(nn.Module):
             z_proj = (z * self.w).sum(dim=1)
         else:
             z_proj = z @ self.w
-        lam = F.softplus(self.b + z_proj + h) + self.eps
+        logits = self.b + z_proj + h
+        if self.intensity_activation == "softplus":
+            beta = max(self.intensity_beta, 1e-6)
+            lam = F.softplus(logits * beta) / beta
+        elif self.intensity_activation == "exp":
+            lam = torch.exp(logits)
+        elif self.intensity_activation == "relu":
+            lam = F.relu(logits)
+        elif self.intensity_activation == "leaky_relu":
+            lam = F.leaky_relu(logits, negative_slope=self.intensity_neg_slope)
+        else:
+            raise ValueError(f"Unsupported intensity_activation: {self.intensity_activation}")
+        lam = lam + self.eps
+        if self.intensity_min > 0:
+            lam = lam.clamp_min(self.intensity_min)
         return lam, lam.sum()
 
     def intensity(self, t: torch.Tensor, z: torch.Tensor, g: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -289,7 +352,19 @@ class GDCH(nn.Module):
             r_in = torch.cat([ge, z], dim=-1)
         else:
             r_in = ge
-        r = torch.sigmoid(self.mlp_r(r_in))
+        gate_logits = self.mlp_r(r_in)
+        if self.gate_activation == "sigmoid":
+            r = torch.sigmoid(gate_logits)
+        elif self.gate_activation == "tanh":
+            r = torch.tanh(gate_logits)
+        elif self.gate_activation == "relu":
+            r = F.relu(gate_logits)
+        elif self.gate_activation == "softplus":
+            r = F.softplus(gate_logits)
+        elif self.gate_activation == "identity":
+            r = gate_logits
+        else:
+            raise ValueError(f"Unsupported gate_activation: {self.gate_activation}")
         forcing = r * u.unsqueeze(0)
 
         if self.L is None:
