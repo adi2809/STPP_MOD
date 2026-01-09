@@ -74,6 +74,11 @@ class GDCH(nn.Module):
         mlp_layer_norm: bool = False,
         time_mlp_dropout: float = 0.0,
         time_mlp_layer_norm: bool = False,
+        intensity_activation: str = "softplus",
+        intensity_beta: float = 1.0,
+        intensity_min: float = 0.0,
+        intensity_neg_slope: float = 0.01,
+        gate_activation: str = "sigmoid",
         alpha_init: float = 0.1,
         beta_init: float = 0.1,
         jump_eta: float = 0.0,
@@ -142,6 +147,11 @@ class GDCH(nn.Module):
         self.eps = float(eps)
         self.t0_days = float(t0_days)
         self.total_time = float(total_time) if total_time > 0 else 1.0
+        self.intensity_activation = str(intensity_activation).lower()
+        self.intensity_beta = float(intensity_beta)
+        self.intensity_min = float(intensity_min)
+        self.intensity_neg_slope = float(intensity_neg_slope)
+        self.gate_activation = str(gate_activation).lower()
 
         if laplacian is not None:
             self.register_buffer("L", laplacian)
@@ -283,7 +293,21 @@ class GDCH(nn.Module):
             z_proj = (z * self.w).sum(dim=1)
         else:
             z_proj = z @ self.w
-        lam = F.softplus(self.b + z_proj + h) + self.eps
+        logits = self.b + z_proj + h
+        if self.intensity_activation == "softplus":
+            beta = max(self.intensity_beta, 1e-6)
+            lam = F.softplus(logits * beta) / beta
+        elif self.intensity_activation == "exp":
+            lam = torch.exp(logits)
+        elif self.intensity_activation == "relu":
+            lam = F.relu(logits)
+        elif self.intensity_activation == "leaky_relu":
+            lam = F.leaky_relu(logits, negative_slope=self.intensity_neg_slope)
+        else:
+            raise ValueError(f"Unsupported intensity_activation: {self.intensity_activation}")
+        lam = lam + self.eps
+        if self.intensity_min > 0:
+            lam = lam.clamp_min(self.intensity_min)
         return lam, lam.sum()
 
     def intensity(self, t: torch.Tensor, z: torch.Tensor, g: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -328,7 +352,19 @@ class GDCH(nn.Module):
             r_in = torch.cat([ge, z], dim=-1)
         else:
             r_in = ge
-        r = torch.sigmoid(self.mlp_r(r_in))
+        gate_logits = self.mlp_r(r_in)
+        if self.gate_activation == "sigmoid":
+            r = torch.sigmoid(gate_logits)
+        elif self.gate_activation == "tanh":
+            r = torch.tanh(gate_logits)
+        elif self.gate_activation == "relu":
+            r = F.relu(gate_logits)
+        elif self.gate_activation == "softplus":
+            r = F.softplus(gate_logits)
+        elif self.gate_activation == "identity":
+            r = gate_logits
+        else:
+            raise ValueError(f"Unsupported gate_activation: {self.gate_activation}")
         forcing = r * u.unsqueeze(0)
 
         if self.L is None:

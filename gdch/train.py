@@ -43,6 +43,11 @@ def _build_model(config: Dict, metadata: Dict, device: torch.device, laplacian, 
         mlp_layer_norm=bool(model_cfg.get("mlp_layer_norm", False)),
         time_mlp_dropout=float(model_cfg.get("time_mlp_dropout", 0.0)),
         time_mlp_layer_norm=bool(model_cfg.get("time_mlp_layer_norm", False)),
+        intensity_activation=model_cfg.get("intensity_activation", "softplus"),
+        intensity_beta=float(model_cfg.get("intensity_beta", 1.0)),
+        intensity_min=float(model_cfg.get("intensity_min", 0.0)),
+        intensity_neg_slope=float(model_cfg.get("intensity_neg_slope", 0.01)),
+        gate_activation=model_cfg.get("gate_activation", "sigmoid"),
         alpha_init=float(model_cfg.get("alpha_init", 0.1)),
         beta_init=float(model_cfg.get("beta_init", 0.1)),
         jump_eta=float(model_cfg.get("jump_eta", 0.0)),
@@ -209,7 +214,9 @@ def train_from_config(config: Dict) -> str:
                 solver_config=solver_cfg,
                 collect_reg=True,
             )
-            loss, reg_info = add_regularization(nll, reg_terms, model, reg_cfg)
+            num_events = end - start + 1
+            nll_avg = nll / max(num_events, 1)
+            loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
