@@ -116,6 +116,8 @@ def train_from_config(config: Dict) -> str:
 
     set_seed(int(train_cfg.get("seed", 42)))
     device = get_device(train_cfg.get("device", "cuda_if_available"))
+    use_amp = bool(train_cfg.get("use_amp", False)) and device.type == "cuda"
+    use_compile = bool(train_cfg.get("torch_compile", False)) and hasattr(torch, "compile")
 
     times, nodes = data_utils.load_processed_events(data_cfg["events_path"])
     metadata = data_utils.load_metadata(data_cfg["metadata_path"])
@@ -136,6 +138,8 @@ def train_from_config(config: Dict) -> str:
 
     laplacian, jump_kernel = _build_graph(data_cfg.get("distance_matrix_path", ""), config.get("graph", {}), device)
     model = _build_model(config, metadata, device, laplacian, jump_kernel)
+    if use_compile:
+        model = torch.compile(model)
 
     model_cfg = config["model"]
     if bool(model_cfg.get("baseline_from_data", False)) and len(times_train) > 1:
@@ -152,6 +156,7 @@ def train_from_config(config: Dict) -> str:
         lr=float(train_cfg.get("lr", 1e-3)),
         weight_decay=float(train_cfg.get("weight_decay", 0.0)),
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     scheduler_cfg = train_cfg.get("lr_scheduler", None)
     scheduler = None
     scheduler_type = None
@@ -187,10 +192,14 @@ def train_from_config(config: Dict) -> str:
     eval_chunk_size = int(train_cfg.get("eval_chunk_size", chunk_size))
     grad_clip = float(train_cfg.get("grad_clip", 0.0))
     log_every = int(train_cfg.get("log_every", 50))
+    eval_every = int(train_cfg.get("eval_every", 1))
+    warmup_steps = int(train_cfg.get("warmup_steps", 0))
+    base_lr = float(train_cfg.get("lr", 1e-3))
 
     best_val = math.inf
     metrics = []
 
+    global_step = 0
     for epoch in range(1, int(train_cfg.get("epochs", 10)) + 1):
         model.train()
         state = None
@@ -205,6 +214,19 @@ def train_from_config(config: Dict) -> str:
         for start in range(0, len(times_train), chunk_size):
             end = min(start + chunk_size - 1, len(times_train) - 1)
             chunk_counter += 1
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                nll, state, reg_terms = model.nll_chunk(
+                    times_train,
+                    nodes_train,
+                    start_idx=start,
+                    end_idx=end,
+                    state=state,
+                    solver_config=solver_cfg,
+                    collect_reg=True,
+                )
+                num_events = end - start + 1
+                nll_avg = nll / max(num_events, 1)
+                loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
             nll, state, reg_terms = model.nll_chunk(
                 times_train,
                 nodes_train,
@@ -219,10 +241,18 @@ def train_from_config(config: Dict) -> str:
             loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if warmup_steps > 0 and global_step < warmup_steps:
+                warmup_lr = base_lr * float(global_step + 1) / float(warmup_steps)
+                optimizer.param_groups[0]["lr"] = warmup_lr
+            scaler.step(optimizer)
+            scaler.update()
+            if warmup_steps > 0 and global_step < warmup_steps:
+                optimizer.param_groups[0]["lr"] = base_lr
+            global_step += 1
 
             state = detach_state(state)
             nll_sum += nll.item()
@@ -244,7 +274,7 @@ def train_from_config(config: Dict) -> str:
 
         train_nll = nll_sum / max(event_count, 1)
 
-        if len(times_val) > 0:
+        if eval_every > 0 and epoch % eval_every == 0 and len(times_val) > 0:
             val_nll = evaluate_nll(
                 model,
                 times_val,
