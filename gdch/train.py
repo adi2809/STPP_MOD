@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import time
 from typing import Dict, Tuple
 
 import torch
@@ -37,6 +38,17 @@ def _build_model(config: Dict, metadata: Dict, device: torch.device, laplacian, 
         node_embed_dim=int(model_cfg.get("node_embed_dim", 8)),
         mlp_hidden_dim=model_cfg.get("mlp_hidden_dim", None),
         time_hidden_dim=model_cfg.get("time_hidden_dim", None),
+        mlp_layers=model_cfg.get("mlp_layers", None),
+        time_mlp_layers=model_cfg.get("time_mlp_layers", None),
+        mlp_dropout=float(model_cfg.get("mlp_dropout", 0.0)),
+        mlp_layer_norm=bool(model_cfg.get("mlp_layer_norm", False)),
+        time_mlp_dropout=float(model_cfg.get("time_mlp_dropout", 0.0)),
+        time_mlp_layer_norm=bool(model_cfg.get("time_mlp_layer_norm", False)),
+        intensity_activation=model_cfg.get("intensity_activation", "softplus"),
+        intensity_beta=float(model_cfg.get("intensity_beta", 1.0)),
+        intensity_min=float(model_cfg.get("intensity_min", 0.0)),
+        intensity_neg_slope=float(model_cfg.get("intensity_neg_slope", 0.01)),
+        gate_activation=model_cfg.get("gate_activation", "sigmoid"),
         alpha_init=float(model_cfg.get("alpha_init", 0.1)),
         beta_init=float(model_cfg.get("beta_init", 0.1)),
         jump_eta=float(model_cfg.get("jump_eta", 0.0)),
@@ -55,6 +67,48 @@ def _build_model(config: Dict, metadata: Dict, device: torch.device, laplacian, 
     return model.to(device)
 
 
+def _maybe_adjust_min_dt(solver_cfg: Dict, min_gap: float, logger) -> None:
+    if min_gap <= 0:
+        return
+    current_min_dt = float(solver_cfg.get("min_dt", 0.0))
+    if current_min_dt <= 0:
+        solver_cfg["min_dt"] = min_gap / 2.0
+        logger.info("min_dt was unset; setting min_dt=%.6g based on min gap %.6g", solver_cfg["min_dt"], min_gap)
+        return
+    if current_min_dt >= min_gap:
+        solver_cfg["min_dt"] = min_gap / 2.0
+        logger.info(
+            "min_dt=%.6g >= min gap %.6g; lowering min_dt to %.6g to avoid skipping dynamics",
+            current_min_dt,
+            min_gap,
+            solver_cfg["min_dt"],
+        )
+
+
+def _log_graph_warnings(data_cfg: Dict, model_cfg: Dict, laplacian, jump_kernel, logger) -> None:
+    distance_path = data_cfg.get("distance_matrix_path", "")
+    if not distance_path:
+        logger.warning(
+            "distance_matrix_path is empty; spatial diffusion and jump spillover will be disabled"
+        )
+        return
+    if laplacian is None:
+        logger.warning(
+            "distance_matrix_path=%s not found or invalid; spatial diffusion will be disabled",
+            distance_path,
+        )
+    if jump_kernel is None:
+        logger.warning(
+            "distance_matrix_path=%s not found or invalid; jump spillover will be disabled",
+            distance_path,
+        )
+    jump_eta = float(model_cfg.get("jump_eta", 0.0))
+    if jump_kernel is not None and jump_eta == 0.0:
+        logger.warning(
+            "jump_eta=0.0 with a valid distance matrix; set model.jump_eta to enable spillover"
+        )
+
+
 def train_from_config(config: Dict) -> str:
     train_cfg = config["training"]
     data_cfg = config["data"]
@@ -63,6 +117,8 @@ def train_from_config(config: Dict) -> str:
 
     set_seed(int(train_cfg.get("seed", 42)))
     device = get_device(train_cfg.get("device", "cuda_if_available"))
+    use_amp = bool(train_cfg.get("use_amp", False)) and device.type == "cuda"
+    use_compile = bool(train_cfg.get("torch_compile", False)) and hasattr(torch, "compile")
 
     times, nodes = data_utils.load_processed_events(data_cfg["events_path"])
     metadata = data_utils.load_metadata(data_cfg["metadata_path"])
@@ -83,6 +139,8 @@ def train_from_config(config: Dict) -> str:
 
     laplacian, jump_kernel = _build_graph(data_cfg.get("distance_matrix_path", ""), config.get("graph", {}), device)
     model = _build_model(config, metadata, device, laplacian, jump_kernel)
+    if use_compile:
+        model = torch.compile(model)
 
     model_cfg = config["model"]
     if bool(model_cfg.get("baseline_from_data", False)) and len(times_train) > 1:
@@ -99,6 +157,7 @@ def train_from_config(config: Dict) -> str:
         lr=float(train_cfg.get("lr", 1e-3)),
         weight_decay=float(train_cfg.get("weight_decay", 0.0)),
     )
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     scheduler_cfg = train_cfg.get("lr_scheduler", None)
     scheduler = None
     scheduler_type = None
@@ -124,14 +183,28 @@ def train_from_config(config: Dict) -> str:
     logger = setup_logger(os.path.join(run_dir, "train.log"))
     save_config(config, os.path.join(run_dir, "config.json"))
 
+    _log_graph_warnings(data_cfg, model_cfg, laplacian, jump_kernel, logger)
+
+    if len(times_train) > 1:
+        min_gap = float((times_train[1:] - times_train[:-1]).min().item())
+        _maybe_adjust_min_dt(solver_cfg, min_gap, logger)
+
     chunk_size = int(train_cfg.get("chunk_size", 256))
+    use_dataloader = bool(train_cfg.get("use_dataloader", False))
+    num_workers = int(train_cfg.get("num_workers", 0))
+    pin_memory = bool(train_cfg.get("pin_memory", False))
     eval_chunk_size = int(train_cfg.get("eval_chunk_size", chunk_size))
     grad_clip = float(train_cfg.get("grad_clip", 0.0))
     log_every = int(train_cfg.get("log_every", 50))
+    log_every_seconds = float(train_cfg.get("log_every_seconds", 0.0))
+    eval_every = int(train_cfg.get("eval_every", 1))
+    warmup_steps = int(train_cfg.get("warmup_steps", 0))
+    base_lr = float(train_cfg.get("lr", 1e-3))
 
     best_val = math.inf
     metrics = []
 
+    global_step = 0
     for epoch in range(1, int(train_cfg.get("epochs", 10)) + 1):
         model.train()
         state = None
@@ -139,29 +212,58 @@ def train_from_config(config: Dict) -> str:
         event_count = 0
 
         total_chunks = max(1, math.ceil(len(times_train) / chunk_size))
+        chunk_iter = None
+        if use_dataloader:
+            chunk_iter = data_utils.make_chunk_loader(
+                len(times_train), chunk_size, num_workers=num_workers, pin_memory=pin_memory
+            )
         chunk_counter = 0
         window_nll = 0.0
         window_events = 0
+        last_log_time = time.time()
+        logger.info("epoch=%d/%d start", epoch, int(train_cfg.get("epochs", 10)))
 
-        for start in range(0, len(times_train), chunk_size):
-            end = min(start + chunk_size - 1, len(times_train) - 1)
+        if chunk_iter is None:
+            chunk_iter = range(0, len(times_train), chunk_size)
+        for batch in chunk_iter:
+            if isinstance(batch, int):
+                start = batch
+                end = min(start + chunk_size - 1, len(times_train) - 1)
+            else:
+                start = batch["start"]
+                end = batch["end"]
+                if torch.is_tensor(start):
+                    start = int(start.flatten()[0].item())
+                if torch.is_tensor(end):
+                    end = int(end.flatten()[0].item())
             chunk_counter += 1
-            nll, state, reg_terms = model.nll_chunk(
-                times_train,
-                nodes_train,
-                start_idx=start,
-                end_idx=end,
-                state=state,
-                solver_config=solver_cfg,
-                collect_reg=True,
-            )
-            loss, reg_info = add_regularization(nll, reg_terms, model, reg_cfg)
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                nll, state, reg_terms = model.nll_chunk(
+                    times_train,
+                    nodes_train,
+                    start_idx=start,
+                    end_idx=end,
+                    state=state,
+                    solver_config=solver_cfg,
+                    collect_reg=True,
+                )
+                num_events = end - start + 1
+                nll_avg = nll / max(num_events, 1)
+                loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            scaler.scale(loss).backward()
             if grad_clip and grad_clip > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if warmup_steps > 0 and global_step < warmup_steps:
+                warmup_lr = base_lr * float(global_step + 1) / float(warmup_steps)
+                optimizer.param_groups[0]["lr"] = warmup_lr
+            scaler.step(optimizer)
+            scaler.update()
+            if warmup_steps > 0 and global_step < warmup_steps:
+                optimizer.param_groups[0]["lr"] = base_lr
+            global_step += 1
 
             state = detach_state(state)
             nll_sum += nll.item()
@@ -169,7 +271,11 @@ def train_from_config(config: Dict) -> str:
 
             window_nll += nll.item()
             window_events += end - start + 1
-            if log_every > 0 and (chunk_counter % log_every == 0 or chunk_counter == total_chunks):
+            should_log_chunk = log_every > 0 and (
+                chunk_counter % log_every == 0 or chunk_counter == total_chunks
+            )
+            should_log_time = log_every_seconds > 0 and (time.time() - last_log_time) >= log_every_seconds
+            if should_log_chunk or should_log_time:
                 avg_nll = window_nll / max(window_events, 1)
                 logger.info(
                     "epoch=%d chunk=%d/%d avg_nll=%.6f",
@@ -180,10 +286,11 @@ def train_from_config(config: Dict) -> str:
                 )
                 window_nll = 0.0
                 window_events = 0
+                last_log_time = time.time()
 
         train_nll = nll_sum / max(event_count, 1)
 
-        if len(times_val) > 0:
+        if eval_every > 0 and epoch % eval_every == 0 and len(times_val) > 0:
             val_nll = evaluate_nll(
                 model,
                 times_val,
