@@ -227,6 +227,18 @@ def train_from_config(config: Dict) -> str:
                 num_events = end - start + 1
                 nll_avg = nll / max(num_events, 1)
                 loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
+            nll, state, reg_terms = model.nll_chunk(
+                times_train,
+                nodes_train,
+                start_idx=start,
+                end_idx=end,
+                state=state,
+                solver_config=solver_cfg,
+                collect_reg=True,
+            )
+            num_events = end - start + 1
+            nll_avg = nll / max(num_events, 1)
+            loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
