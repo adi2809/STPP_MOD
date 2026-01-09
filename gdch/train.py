@@ -214,7 +214,9 @@ def train_from_config(config: Dict) -> str:
                 solver_config=solver_cfg,
                 collect_reg=True,
             )
-            loss, reg_info = add_regularization(nll, reg_terms, model, reg_cfg)
+            num_events = end - start + 1
+            nll_avg = nll / max(num_events, 1)
+            loss, reg_info = add_regularization(nll_avg, reg_terms, model, reg_cfg)
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
