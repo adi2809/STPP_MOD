@@ -37,6 +37,17 @@ def _build_model(config: Dict, metadata: Dict, device: torch.device, laplacian, 
         node_embed_dim=int(model_cfg.get("node_embed_dim", 8)),
         mlp_hidden_dim=model_cfg.get("mlp_hidden_dim", None),
         time_hidden_dim=model_cfg.get("time_hidden_dim", None),
+        mlp_layers=model_cfg.get("mlp_layers", None),
+        time_mlp_layers=model_cfg.get("time_mlp_layers", None),
+        mlp_dropout=float(model_cfg.get("mlp_dropout", 0.0)),
+        mlp_layer_norm=bool(model_cfg.get("mlp_layer_norm", False)),
+        time_mlp_dropout=float(model_cfg.get("time_mlp_dropout", 0.0)),
+        time_mlp_layer_norm=bool(model_cfg.get("time_mlp_layer_norm", False)),
+        intensity_activation=model_cfg.get("intensity_activation", "softplus"),
+        intensity_beta=float(model_cfg.get("intensity_beta", 1.0)),
+        intensity_min=float(model_cfg.get("intensity_min", 0.0)),
+        intensity_neg_slope=float(model_cfg.get("intensity_neg_slope", 0.01)),
+        gate_activation=model_cfg.get("gate_activation", "sigmoid"),
         alpha_init=float(model_cfg.get("alpha_init", 0.1)),
         beta_init=float(model_cfg.get("beta_init", 0.1)),
         jump_eta=float(model_cfg.get("jump_eta", 0.0)),
@@ -53,6 +64,48 @@ def _build_model(config: Dict, metadata: Dict, device: torch.device, laplacian, 
         jump_kernel=jump_kernel,
     )
     return model.to(device)
+
+
+def _maybe_adjust_min_dt(solver_cfg: Dict, min_gap: float, logger) -> None:
+    if min_gap <= 0:
+        return
+    current_min_dt = float(solver_cfg.get("min_dt", 0.0))
+    if current_min_dt <= 0:
+        solver_cfg["min_dt"] = min_gap / 2.0
+        logger.info("min_dt was unset; setting min_dt=%.6g based on min gap %.6g", solver_cfg["min_dt"], min_gap)
+        return
+    if current_min_dt >= min_gap:
+        solver_cfg["min_dt"] = min_gap / 2.0
+        logger.info(
+            "min_dt=%.6g >= min gap %.6g; lowering min_dt to %.6g to avoid skipping dynamics",
+            current_min_dt,
+            min_gap,
+            solver_cfg["min_dt"],
+        )
+
+
+def _log_graph_warnings(data_cfg: Dict, model_cfg: Dict, laplacian, jump_kernel, logger) -> None:
+    distance_path = data_cfg.get("distance_matrix_path", "")
+    if not distance_path:
+        logger.warning(
+            "distance_matrix_path is empty; spatial diffusion and jump spillover will be disabled"
+        )
+        return
+    if laplacian is None:
+        logger.warning(
+            "distance_matrix_path=%s not found or invalid; spatial diffusion will be disabled",
+            distance_path,
+        )
+    if jump_kernel is None:
+        logger.warning(
+            "distance_matrix_path=%s not found or invalid; jump spillover will be disabled",
+            distance_path,
+        )
+    jump_eta = float(model_cfg.get("jump_eta", 0.0))
+    if jump_kernel is not None and jump_eta == 0.0:
+        logger.warning(
+            "jump_eta=0.0 with a valid distance matrix; set model.jump_eta to enable spillover"
+        )
 
 
 def train_from_config(config: Dict) -> str:
@@ -123,6 +176,12 @@ def train_from_config(config: Dict) -> str:
     run_dir = make_run_dir(train_cfg.get("artifacts_dir", "artifacts"), train_cfg.get("run_name", "gdch"))
     logger = setup_logger(os.path.join(run_dir, "train.log"))
     save_config(config, os.path.join(run_dir, "config.json"))
+
+    _log_graph_warnings(data_cfg, model_cfg, laplacian, jump_kernel, logger)
+
+    if len(times_train) > 1:
+        min_gap = float((times_train[1:] - times_train[:-1]).min().item())
+        _maybe_adjust_min_dt(solver_cfg, min_gap, logger)
 
     chunk_size = int(train_cfg.get("chunk_size", 256))
     eval_chunk_size = int(train_cfg.get("eval_chunk_size", chunk_size))
